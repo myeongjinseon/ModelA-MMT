@@ -3,7 +3,7 @@ from collections import defaultdict
 from stanfordcorenlp import StanfordCoreNLP
 import os
 
-nlp = StanfordCoreNLP(r'../stanford-corenlp-4.3.2')#, lang='de')
+nlp = StanfordCoreNLP('http://localhost', port=9003, timeout=15000)
 
 def get_sentence_list():
     sentence_list = []

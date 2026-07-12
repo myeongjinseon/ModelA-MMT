@@ -45,22 +45,22 @@ def selective_attention_visualization(model_path):
         # Get attention maps, src_tokens and origin_tokens
         attn_map_path = os.path.join(model_path, 'visualization', str(batch) + 'map.pth')
         src_tokens_path = os.path.join(model_path, 'visualization', str(batch) + 'tokens.pth')
-        origin_tokens_path = os.path.join(root_path, 'origin_tokens', str(batch) + 'tokens.pth')
+        # origin_tokens_path = os.path.join(root_path, 'origin_tokens', str(batch) + 'tokens.pth')
 
         attn_map = torch.load(attn_map_path, map_location=torch.device('cpu'))
         src_tokens = torch.load(src_tokens_path, map_location=torch.device('cpu'))
-        origin_tokens = torch.load(origin_tokens_path, map_location=torch.device('cpu'))
+        # origin_tokens = torch.load(origin_tokens_path, map_location=torch.device('cpu'))
 
         for sent_num in range(attn_map.shape[0]):
             filename = test_images_filename_list[translation_order_list[batch * 128 + sent_num]]
             # Images for test
-            if filename != '2321764238.jpg':
+            if filename != '129860826.jpg':
                 continue
             # if filename != '327955368.jpg':
             #     continue
             print(filename)
 
-            img = Image.open(os.path.join(root_path, "images", filename), mode='r')
+            img = Image.open(os.path.join("../flickr30k/flickr30k-images", filename), mode='r')
             plt.figure(filename, figsize=(8, 8))
 
             for word_num in range(attn_map.shape[1]):
@@ -69,8 +69,8 @@ def selective_attention_visualization(model_path):
                 # Get the word with the dictionary and src_tokens
                 word = src_tokens.cpu().numpy()[sent_num][word_num]
                 word = dic_no2word[word]
-                origin_word = origin_tokens.cpu().numpy()[sent_num][word_num]
-                origin_word = dic_no2word[origin_word]
+                # origin_word = origin_tokens.cpu().numpy()[sent_num][word_num]
+                # origin_word = dic_no2word[origin_word]
 
                 # Skip '<pad>' and '<eos>'
                 if word == '<pad>' or word == '<eos>':
@@ -78,7 +78,8 @@ def selective_attention_visualization(model_path):
 
                 # Show the image
                 plt.subplot(math.ceil(attn_map.shape[1] / 4), 4, word_num + 1)
-                plt.title(word + '-' + origin_word, fontsize=9)
+                # plt.title(word + '-' + origin_word, fontsize=9)
+                plt.title(word, fontsize=9)
                 plt.imshow(img, alpha=1)
                 plt.axis('off')
 
@@ -90,11 +91,12 @@ def selective_attention_visualization(model_path):
                 # Show the visual attention map of the word
                 plt.imshow(normed_attn, alpha=0.4, interpolation='nearest', cmap='jet')
                 plt.axis('off')
+
             plt.show()
 
 
 if __name__ == "__main__":
-    model_path  = '../checkpoints/multi30k-en2de/vit_base_patch16_384/vit_base_patch16_384-mask4'
+    model_path  = '../checkpoints/multi30k-en2de/vit_tiny_patch16_384/vit_tiny_patch16_384-mask0-learnable_lambda'
     selective_attention_visualization(model_path)
 
 

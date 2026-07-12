@@ -21,3 +21,21 @@ class ImageDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return self.size
+
+# import torch
+# import numpy as np
+
+# class ImageDataset(torch.utils.data.Dataset):
+#     """
+#     For loading image datasets
+#     """
+#     def __init__(self, feat_path: str):
+#         self.img_feat = np.load(feat_path, mmap_mode="r")
+
+#         self.size = self.img_feat.shape[0]
+
+#     def __getitem__(self, idx):
+#         return torch.from_numpy(self.img_feat[idx].copy()), None
+
+#     def __len__(self):
+#         return self.size

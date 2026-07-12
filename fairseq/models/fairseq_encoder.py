@@ -19,6 +19,11 @@ EncoderOut = NamedTuple(
         ("encoder_states", Optional[List[Tensor]]),  # List[T x B x C]
         ("src_tokens", Optional[Tensor]),  # B x T
         ("src_lengths", Optional[Tensor]),  # B x 1
+        # --- multimodal 추가 ---
+        ("vision_out", Optional[Tensor]),             # (T, B, C)
+        ("vision_padding_mask", Optional[Tensor]),    # (B, T)
+        ("vision_embedding", Optional[Tensor]),
+        ("vision_states", Optional[List[Tensor]]),
     ],
 )
 

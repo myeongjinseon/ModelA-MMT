@@ -2,20 +2,17 @@
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
-# import wandb
+import wandb
 
 from typing import Dict, List, Optional
 
 import torch
-import os
 import torch.nn as nn
-import torch.nn.functional as F
 from fairseq import utils
 from fairseq.modules import LayerNorm, MultiheadAttention
 from fairseq.modules.fairseq_dropout import FairseqDropout
 from fairseq.modules.quant_noise import quant_noise
 from torch import Tensor
-import torch.distributed as dist
 
 class TransformerEncoderLayer(nn.Module):
     """Encoder layer block.
@@ -36,12 +33,12 @@ class TransformerEncoderLayer(nn.Module):
         super().__init__()
         '''----------------------------Embeded&Position-----------------------------------'''
         self.embed_dim = args.encoder_embed_dim
-        self.quant_noise = getattr(args, "quant_noise_pq", 0)  #Quantization Noise 관련 하이퍼파라미터(정규화/견고성 목적). 없으면 0으로 둠. 논문 원형엔 없지만 fairseq의 선택적 정규화 기법.
+        self.quant_noise = getattr(args, "quant_noise_pq", 0)  
         self.quant_noise_block_size = getattr(args, "quant_noise_pq_block_size", 8) 
 
         '''----------------------------Self Attn.&Add_Norm-----------------------------------'''
-        self.self_attn = self.build_self_attention(self.embed_dim, args) # multi-head self attention
-        self.self_attn_layer_norm = LayerNorm(self.embed_dim) # attention block용 layer_norm
+        self.self_attn = self.build_self_attention(self.embed_dim, args)
+        self.self_attn_layer_norm = LayerNorm(self.embed_dim)
         self.dropout_module = FairseqDropout(
             args.dropout, module_name=self.__class__.__name__
         ) # 공통 드롭아웃. 어텐션 출력이나 FFN 출력에 사용.
@@ -49,7 +46,7 @@ class TransformerEncoderLayer(nn.Module):
         '''----------------------------FFN&Add_Norm-----------------------------------'''
         self.activation_fn = utils.get_activation_fn(
             activation=getattr(args, "activation_fn", "relu")
-        ) #FFN 내의 비선형 함수 (ReLU)
+        )
         activation_dropout_p = getattr(args, "activation_dropout", 0)
         if activation_dropout_p == 0:
             # for backwards compatibility with models that use args.relu_dropout (FFN)
@@ -57,14 +54,14 @@ class TransformerEncoderLayer(nn.Module):
         self.activation_dropout_module = FairseqDropout(
             float(activation_dropout_p), module_name=self.__class__.__name__
         )
-        self.normalize_before = args.encoder_normalize_before #Pre-LN vs Post-LN 스위치
-        self.fc1 = self.build_fc1( #FFN의 첫 선형층
+        self.normalize_before = args.encoder_normalize_before
+        self.fc1 = self.build_fc1( # 1st FFN
             self.embed_dim,
             args.encoder_ffn_embed_dim,
             self.quant_noise,
             self.quant_noise_block_size,
         )
-        self.fc2 = self.build_fc2( #FFN의 두번째 선형층
+        self.fc2 = self.build_fc2( # 2nd FFN
             args.encoder_ffn_embed_dim,
             self.embed_dim,
             self.quant_noise,
@@ -83,7 +80,6 @@ class TransformerEncoderLayer(nn.Module):
             nn.Linear(input_dim, output_dim), p=q_noise, block_size=qn_block_size
         )
 
-    # 인코더 셀프어텐션 부분
     def build_self_attention(self, embed_dim, args):
         return MultiheadAttention(
             embed_dim,
@@ -94,11 +90,9 @@ class TransformerEncoderLayer(nn.Module):
             qn_block_size=self.quant_noise_block_size,
         )
     
-    # add 부분
     def residual_connection(self, x, residual):
         return residual + x
 
-    # layer norm하는 부분
     def upgrade_state_dict_named(self, state_dict, name):
         """
         Rename layer norm states from `...layer_norms.0.weight` to
@@ -166,7 +160,6 @@ class TransformerEncoderLayer(nn.Module):
             x = self.final_layer_norm(x)
         return x
 
-## 인코더를 srs_txt를 위한 인코더와 ViT+Selec Attn. 두개로 해야하는것인가?
 
 class TransformerDecoderLayer(nn.Module):
     """Decoder layer block.
@@ -236,13 +229,9 @@ class TransformerDecoderLayer(nn.Module):
         else:
             self.encoder_attn = self.build_encoder_attention(self.embed_dim, args)
             self.encoder_attn_layer_norm = LayerNorm(self.embed_dim, export=export)
-
+            #추가
             self.encoder_attn_vis = self.build_encoder_attention(self.embed_dim, args)
-            self.encoder_attn_vis_layer_norm = LayerNorm(self.embed_dim, export=export) 
-            
-            # self.encoder_attn_vis.q_proj.weight = self.encoder_attn.q_proj.weight
-            # if self.encoder_attn.q_proj.bias is not None:
-            #     self.encoder_attn_vis.q_proj.bias = self.encoder_attn.q_proj.bias
+            self.encoder_attn_vis_layer_norm = LayerNorm(self.embed_dim, export=export)
 
         self.fc1 = self.build_fc1(
             self.embed_dim,
@@ -263,18 +252,27 @@ class TransformerDecoderLayer(nn.Module):
         self.onnx_trace = False
         
         #추가
-        # self.lambda_param = nn.Parameter(torch.tensor(0.5))  
-        # self.gate = nn.Linear(2*self.embed_dim,self.embed_dim)
+        self.fuse_proj = nn.Linear(2 * self.embed_dim, self.embed_dim)
+        self.fuse_dropout = nn.Dropout(getattr(args, "dropout", 0.1))
 
-        Model_Variation = os.getenv("MODEL_VARIATION_ENV", "learnable_lambda")
+        self.lambda_param = nn.Parameter(torch.tensor(0.5))
 
-        self.model_variation = Model_Variation
+        #entropy
+        self.alpha = nn.Parameter(torch.tensor(3.0), requires_grad=False)  # 민감도(튜닝 후 필요하면 학습 가능 True)
+        self._entropy_eps = 1e-8  # log 안정화용
+        self.vis_dim_adapter = None
 
-        if self.model_variation == "learnable_lambda":
-            self.lambda_param = nn.Parameter(torch.tensor(0.5))
+        '''
+        # Shared latent alignment projection
+        self.align_proj = SharedLatentAlign(
+            txt_dim=args.encoder_embed_dim,
+            vis_dim=args.encoder_embed_dim,  # 둘 다 hidden_dim 맞춰짐
+            hidden_dim=self.embed_dim,
+            proj_dim=self.embed_dim // 2
+        )
+        self.align_alpha = getattr(args, "align_alpha", 0.1)
+        '''
 
-        elif self.model_variation == "gated_fusion":
-            self.gate = nn.Linear(2 * self.embed_dim, self.embed_dim)
 
     def build_fc1(self, input_dim, output_dim, q_noise, qn_block_size):
         return quant_noise(nn.Linear(input_dim, output_dim), q_noise, qn_block_size)
@@ -347,10 +345,10 @@ class TransformerDecoderLayer(nn.Module):
         if need_head_weights:
             need_attn = True
 
+        '''------------------------------- Self Attn. -----------------------------------'''
         residual = x
         if self.normalize_before:
             x = self.self_attn_layer_norm(x)
-            
         # 이전 값이 존재할 때,
         if prev_self_attn_state is not None:
             prev_key, prev_value = prev_self_attn_state[:2]
@@ -431,20 +429,17 @@ class TransformerDecoderLayer(nn.Module):
                 key_padding_mask=encoder_padding_mask,    
                 incremental_state=incremental_state,
                 static_kv=True,
-                # need_weights=need_attn or (not self.training and self.need_attn),
-                need_head_weights = False
-                # need_head_weights=need_head_weights,
+                need_weights=need_attn or (not self.training and self.need_attn),
+                # need_head_weights = False
+                need_head_weights=need_head_weights,
             ) # T_dec, B, C , B, T_dec, T_enc
-            
             x_text = self.dropout_module(x_text)
-            # x_text = self.residual_connection(x_text, residual)
-            # if not self.normalize_before:
-            #     x_text = self.encoder_attn_layer_norm(x_text)
+            x_text = self.residual_connection(x_text, residual)
+            if not self.normalize_before:
+                x_text = self.encoder_attn_layer_norm(x_text)
 
         # ---- 2) VISION cross-attn ----
         if self.encoder_attn_vis is not None and vision_out is not None:
-
-            x_q = self.encoder_attn_vis_layer_norm(x) if self.normalize_before else x
 
             x_vis, attn_vision = self.encoder_attn_vis(
                 query=x_q,
@@ -453,78 +448,61 @@ class TransformerDecoderLayer(nn.Module):
                 key_padding_mask=vision_padding_mask,   
                 incremental_state=incremental_state,
                 static_kv=True,
-                # need_weights=need_attn or (not self.training and self.need_attn),
-                need_head_weights = False
-                # need_head_weights=need_head_weights,
+                need_weights=need_attn or (not self.training and self.need_attn),
+                # need_head_weights = False
+                need_head_weights=need_head_weights,
             ) # T_dec, B, C , B, T_dec, T_enc
-
             x_vis = self.dropout_module(x_vis)
-            # x_vis = self.residual_connection(x_vis, residual)
-            # if not self.normalize_before:
-            #     x_vis = self.encoder_attn_vis_layer_norm(x_vis)
+            x_vis = self.residual_connection(x_vis, residual)
+            if not self.normalize_before:
+                x_vis = self.encoder_attn_vis_layer_norm(x_vis)
 
-        ########################LAB###########################
-        # if self.model_variation == "0.5_sum":
-        #     x = 0.5 * x_text + 0.5 * x_vis
+        p_text   = attn_text.softmax(dim=-1)     # B, T_dec, T_enc
+        p_vision = attn_vision.softmax(dim=-1)   # B, T_dec, T_enc
 
-        # elif self.model_variation == "learnable_lambda":
-        #     lamda = torch.sigmoid(self.lambda_param)
-        #     x = (1 - lamda) * x_text + lamda * x_vis
-
-        # elif self.model_variation == "gated_fusion":
-        #     merge = torch.cat([x_vis, x_text], dim=-1)
-        #     lamda = torch.sigmoid(self.gate(merge))
-        #     x = x_text + lamda * x_vis
-
-        Model_Variation = os.getenv("MODEL_VARIATION_ENV", "learnable_lambda")
-
-        if(Model_Variation == "0.5_sum"):
-            x = 0.5*x_text + 0.5*x_vis
-            
-        #learnable lambda
-        if(Model_Variation == "learnable_lambda"):
-            lambda_value = torch.sigmoid(self.lambda_param)
-            x = (1-lambda_value)*x_text + lambda_value*x_vis
-
-        # lamda tensor (gated_fusion)
-        if(Model_Variation == "gated_fusion"):
-            merge = torch.cat([x_vis,x_text], dim=-1) # dT x B x 2*C
-            lamda = torch.sigmoid(self.gate(merge)) # dT x B x C
-            x = x_text + lamda*x_vis # dT x B x C
-
-        # lambda_entropy
-        # tau = 0.6
-        # p_text = (attn_text / tau).softmax(dim=-1)
-        # p_vision = (attn_vision / tau).softmax(dim=-1)
-
-        # eps = 1e-12
-        # # clamp_min(eps) prevents 0log(0) situation. 
-        # H_text = -(p_text.clamp_min(eps) * (p_text.clamp_min(eps)).log()).sum(dim=-1)     # B, T_dec 
-        # H_vis  = -(p_vision.clamp_min(eps) * (p_vision.clamp_min(eps)).log()).sum(dim=-1) # B, T_dec
+        eps = 1e-12
+        # clamp_min(eps) prevents 0log(0) situation. 
+        H_text = -(p_text.clamp_min(eps) * (p_text.clamp_min(eps)).log()).sum(dim=-1)     # B, T_dec 
+        H_vis  = -(p_vision.clamp_min(eps) * (p_vision.clamp_min(eps)).log()).sum(dim=-1) # B, T_dec
         
-        # T_enc = p_text.size(-1)
-        # H_max = torch.log(torch.tensor(T_enc, device=H_text.device, dtype=H_text.dtype))
+        T_enc = p_text.size(-1)
+        H_max = torch.log(torch.tensor(T_enc, device=H_text.device, dtype=H_text.dtype))
         
-        # H_text_n = (H_text / H_max).clamp(0, 1)  # (B, T_dec)
-        # H_vis_n  = (H_vis  / H_max).clamp(0, 1)
+        H_text_n = (H_text / H_max).clamp(0, 1)  # (B, T_dec)
+        H_vis_n  = (H_vis  / H_max).clamp(0, 1)
 
-        # C_text = 1.0 - H_text_n  # B, T_dec
-        # C_vis  = 1.0 - H_vis_n      # B, T_dec
+        C_text = 1.0 - H_text_n  # B, T_dec
+        C_vis  = 1.0 - H_vis_n      # B, T_dec
 
-        # lambda_raw = C_vis / (C_text + C_vis + 1e-8)
-        # lambda_val = lambda_raw.clamp(0.0, 1.0)
+        lambda_raw = C_vis / (C_text + C_vis + 1e-8)
+        lambda_val = lambda_raw.clamp(0.0, 1.0)
 
-        # # lambda: (B, T_dec) -> (T_dec, B, 1)
-        # lambda_tb1 = lambda_val.transpose(0,1).unsqueeze(-1)    # T_dec, B, 1
-        # x = (1.0 - lambda_tb1) * x_text + lambda_tb1 * x_vis  # T_dec, B, C              
+        # lambda: (B, T_dec) -> (T_dec, B, 1)
+        lambda_tb1 = lambda_val.transpose(0,1).unsqueeze(-1)    # T_dec, B, 1
+        x = (1.0 - lambda_tb1) * x_text + lambda_tb1 * x_vis  # T_dec, B, C
 
-        x = self.residual_connection(x, residual)
-        if not self.normalize_before:
-            x = self.encoder_attn_layer_norm(x)   
+        # 0.5 sum
+        # x = 0.5 * x_text + 0.5 * x_vis
 
+        x = x_text + x_vis
 
+        ''' 
+        # lambda 사용
+        lamda = torch.sigmoid(self.lambda_param)
+        x = lamda * x_text + (1-lamda) * x_vis
+        '''
+
+        if attn_text is not None and attn_vision is not None:
+            attn = torch.cat([attn_text, attn_vision], dim=-1)
+        else:
+            attn = attn_text if attn_vision is None else attn_vision
+
+        '''
+        if (x_text is not None) and (x_vis is not None):
+            x_fused = torch.cat([x_text, x_vis], dim=-1)   
+            x = self.fuse_proj(x_fused)                     
+        '''
         '''---------------------------- FFN & Norm ------------------------------'''   
-
         residual = x
         if self.normalize_before:
             x = self.final_layer_norm(x) 
@@ -549,50 +527,51 @@ class TransformerDecoderLayer(nn.Module):
                 self_attn_state = [saved_state["prev_key"], saved_state["prev_value"]]
             return x, attn, self_attn_state
 
-        # residual_text = x_text
-        # residual_vis = x_vis
+        '''
+        residual_text = x_text
+        residual_vis = x_vis
 
-        # if self.normalize_before:
-        #     x_text = self.final_layer_norm(x_text)
-        #     x_vis = self.final_layer_norm(x_vis) 
+        if self.normalize_before:
+            x_text = self.final_layer_norm(x_text)
+            x_vis = self.final_layer_norm(x_vis) 
 
-        # x_text = self.activation_fn(self.fc1(x_text))
-        # x_vis = self.activation_fn(self.fc1(x_vis))
+        x_text = self.activation_fn(self.fc1(x_text))
+        x_vis = self.activation_fn(self.fc1(x_vis))
 
-        # x_text = self.activation_dropout_module(x_text)
-        # x_vis = self.activation_dropout_module(x_vis)
+        x_text = self.activation_dropout_module(x_text)
+        x_vis = self.activation_dropout_module(x_vis)
 
-        # x_text = self.fc2(x_text)
-        # x_vis = self.fc2(x_vis)
+        x_text = self.fc2(x_text)
+        x_vis = self.fc2(x_vis)
 
-        # x_text = self.dropout_module(x_text)
-        # x_vis = self.dropout_module(x_vis)
+        x_text = self.dropout_module(x_text)
+        x_vis = self.dropout_module(x_vis)
 
-        # x_text = self.residual_connection(x_text, residual_text)
-        # x_vis = self.residual_connection(x_vis, residual_vis)
+        x_text = self.residual_connection(x_text, residual_text)
+        x_vis = self.residual_connection(x_vis, residual_vis)
 
-        # lamda = torch.sigmoid(self.lambda_param)
-        # x = lamda * x_text + (1-lamda) * x_vis
+        x = (1.0 - lambda_tb1) * x_text + lambda_tb1 * x_vis  # T_dec, B, C
 
-        # if not self.normalize_before:
-        #     x_text = self.final_layer_norm(x_text)
-        #     x_vis = self.final_layer_norm(x_vis)
-        #     lamda = torch.sigmoid(self.lambda_param)
-        #     x = lamda * x_text + (1-lamda) * x_vis
-        # if self.onnx_trace and incremental_state is not None:
-        #     saved_state = self.self_attn._get_input_buffer(incremental_state)
-        #     assert saved_state is not None
-        #     if self_attn_padding_mask is not None:
-        #         self_attn_state = [
-        #             saved_state["prev_key"],
-        #             saved_state["prev_value"],
-        #             saved_state["prev_key_padding_mask"],
-        #         ]
-        #     else:
-        #         self_attn_state = [saved_state["prev_key"], saved_state["prev_value"]]
-        #         lamda = torch.sigmoid(self.lambda_param)
-        #         x = lamda * x_text + (1-lamda) * x_vis
-        #     return x, attn, self_attn_state
+        if not self.normalize_before:
+            x_text = self.final_layer_norm(x_text)
+            x_vis = self.final_layer_norm(x_vis)
+            # lamda = torch.sigmoid(self.lambda_param)
+            x = (1.0 - lambda_tb1) * x_text + lambda_tb1 * x_vis  # T_dec, B, C
+        if self.onnx_trace and incremental_state is not None:
+            saved_state = self.self_attn._get_input_buffer(incremental_state)
+            assert saved_state is not None
+            if self_attn_padding_mask is not None:
+                self_attn_state = [
+                    saved_state["prev_key"],
+                    saved_state["prev_value"],
+                    saved_state["prev_key_padding_mask"],
+                ]
+            else:
+                self_attn_state = [saved_state["prev_key"], saved_state["prev_value"]]
+            lamda = torch.sigmoid(self.lambda_param)
+            x = (1.0 - lambda_tb1) * x_text + lambda_tb1 * x_vis  # T_dec, B, C
+            return x, attn, self_attn_state
+        '''
 
         return x, attn, None
 
@@ -607,3 +586,4 @@ def Linear(in_features, out_features, bias=True):
     if bias:
         nn.init.constant_(m.bias, 0.0)
     return m
+

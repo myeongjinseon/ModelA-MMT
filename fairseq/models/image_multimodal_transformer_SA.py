@@ -186,6 +186,8 @@ class TransformerModel(FairseqEncoderDecoderModel):
 
         parser.add_argument('--is-fusion-top', type=bool,
                             help='fuse img feat after text encoding')
+        parser.add_argument('--decoder-full-image', action='store_true', default=False,
+                            help='let decoder vision cross-attention attend to both selective visual outputs and full image features')
 
     @classmethod
     def build_model(cls, args, task):
@@ -263,6 +265,7 @@ class TransformerModel(FairseqEncoderDecoderModel):
 
     # TorchScript doesn't support optional arguments with variable length (**kwargs).
     # Current workaround is to add union of all arguments in child classes.
+    #인코더에서 들어오는 애들
     def forward(
         self,
         src_tokens,
@@ -282,8 +285,11 @@ class TransformerModel(FairseqEncoderDecoderModel):
         which are not supported by TorchScript.
         """
         encoder_out = self.encoder(
-            src_tokens, src_lengths=src_lengths, return_all_hiddens=return_all_hiddens,
-            img_masks_list=img_masks_list, imgs_list=imgs_list,
+            src_tokens, 
+            src_lengths=src_lengths, 
+            return_all_hiddens=return_all_hiddens,
+            img_masks_list=img_masks_list, 
+            imgs_list=imgs_list,
         )
         decoder_out = self.decoder(
             prev_output_tokens,
@@ -293,8 +299,8 @@ class TransformerModel(FairseqEncoderDecoderModel):
             alignment_heads=alignment_heads,
             src_lengths=src_lengths,
             return_all_hiddens=return_all_hiddens,
-        )
-        return decoder_out
+        ) 
+        return decoder_out # B, T, V
 
     # Since get_normalized_probs is in the Fairseq Model which is not scriptable,
     # I rewrite the get_normalized_probs from Base Class to call the
@@ -385,8 +391,16 @@ class TransformerEncoder(FairseqEncoder):
                         intermediate_dim=embed_dim, output_dim=embed_dim,
                         num_heads=1, attn_drop=args.SA_attention_dropout) for i in args.image_feat_dim])
 
-        self.gate_denses = nn.ModuleList([])
-        self.gate_denses.extend([nn.Linear(2 * args.encoder_embed_dim, args.encoder_embed_dim) for i in args.image_feat_dim])
+        # Full-image path for the decoder.
+        # Keep this branch conditional so old baseline checkpoints remain load-compatible
+        # when --decoder-full-image is not enabled.
+        self.decoder_full_image = getattr(args, "decoder_full_image", False)
+        self.raw_image_projs = nn.ModuleList([])
+        if self.decoder_full_image:
+            self.raw_image_projs.extend([
+                nn.Identity() if i == embed_dim else Linear(i, embed_dim, bias=False)
+                for i in args.image_feat_dim
+            ])
 
         self.image_dropout_module = FairseqDropout(
             args.SA_image_dropout, module_name=self.__class__.__name__
@@ -405,7 +419,7 @@ class TransformerEncoder(FairseqEncoder):
 
     def f(self, l, fun='sum'):
         if fun == 'avg':
-            size = len(l)
+            size = len(l)  
             res = l[0]
             for i in l[1:]:
                 res = res + i
@@ -422,20 +436,16 @@ class TransformerEncoder(FairseqEncoder):
         image = self.image_dropout_module(image)
         text = self.text_dropout_module(text)
         output, _map = self.selective_attns[idx](query=text, key=image, value=image, key_padding_mask=image_mask)   # t, b, c
+    
+        _map = _map[:,:,1:].softmax(dim=-1)
+        self.recoder.record_map(_map.cpu())
         
-        merge = torch.cat([output, text], dim=-1)
-        gate = torch.sigmoid(self.gate_denses[idx](merge))
-
-        # self.recoder.record_gate(gate.cpu(), text_mask.cpu())
-        # _map = _map[:,:,1:].softmax(dim=-1)
-        # self.recoder.record_map(_map.cpu())
-        
-        res = (1 - gate) * text + gate * output
-        return res
-
+        return output
+    
     def build_encoder_layer(self, args):
         return TransformerEncoderLayer(args)
 
+    '''-------------------------- Embeded&Position -----------------------------'''
     def forward_embedding(
         self, src_tokens, token_embedding: Optional[torch.Tensor] = None
     ):
@@ -451,7 +461,7 @@ class TransformerEncoder(FairseqEncoder):
         if self.quant_noise is not None:
             x = self.quant_noise(x)
         return x, embed
-
+    
     def forward(
         self,
         src_tokens,
@@ -479,56 +489,98 @@ class TransformerEncoder(FairseqEncoder):
                 - **encoder_padding_mask** (ByteTensor): the positions of
                   padding elements of shape `(batch, src_len)`
                 - **encoder_embedding** (Tensor): the (scaled) embedding lookup
-                  of shape `(batch, src_len, embed_dim)`
+                  of shape 😌`(batch, src_len, embed_dim)`
                 - **encoder_states** (List[Tensor]): all intermediate
                   hidden states of shape `(src_len, batch, embed_dim)`.
                   Only populated if *return_all_hiddens* is True.
         """
-        # import os
-        # torch.save(src_tokens.cpu(), os.path.join(self.args.save_dir, 'visualization', str(self.recoder.n)+'tokens.pth'), _use_new_zipfile_serialization=False)
+        import os
+        torch.save(src_tokens.cpu(), os.path.join(self.args.save_dir, 'visualization', str(self.recoder.n)+'tokens.pth'), _use_new_zipfile_serialization=False)
 
-        x, encoder_embedding = self.forward_embedding(src_tokens, token_embeddings)
+        x_text, encoder_embedding = self.forward_embedding(src_tokens, token_embeddings)
 
-        # B x T x C -> T x B x C
-        x = x.transpose(0, 1)
+        # B x T x C -> T x B x C => 텍스트
+        x_text = x_text.transpose(0, 1) 
 
         # compute padding mask
         encoder_padding_mask = src_tokens.eq(self.padding_idx)
 
         encoder_states = [] if return_all_hiddens else None
-        xs = []
+        xs: List[Tensor] = []
+
+        # Keep full image feature sequences for the decoder before selective attention
+        # compresses them into source-token-aligned visual summaries.
+        # Shapes after transpose/projection: (num_image_positions, batch, embed_dim)
+        raw_vision_xs: List[Tensor] = []
+        raw_vision_masks: List[Tensor] = []
+        if self.decoder_full_image:
+            for raw_idx, (img, img_mask) in enumerate(zip(imgs_list, img_masks_list)):
+                img_t = img.transpose(0, 1)
+                raw_vision_xs.append(self.raw_image_projs[raw_idx](img_t))
+                raw_vision_masks.append(img_mask)
+
         idx = 0
         if not self.is_fusion_top:
             for img, img_mask in zip(imgs_list, img_masks_list):
                 img = img.transpose(0, 1)
-                xs.append(self.fuse_img_feat(x, idx, img, img_mask, text_mask=src_tokens.ne(self.padding_idx)))
+                xs.append(self.fuse_img_feat(x_text, idx, img, img_mask, text_mask=src_tokens.ne(self.padding_idx)))
                 idx += 1
             
         # encoder layers
         for layer in self.layers:
-            x = layer(x, encoder_padding_mask)
+            x_text = layer(x_text, encoder_padding_mask)
             if return_all_hiddens:
                 assert encoder_states is not None
-                encoder_states.append(x)
+                encoder_states.append(x_text)
 
         if self.layer_norm is not None:
-            x = self.layer_norm(x)
+            x_text = self.layer_norm(x_text)
+
+        x_vision = x_text
 
         if self.is_fusion_top:
             for img, img_mask in zip(imgs_list, img_masks_list):
                 img = img.transpose(0, 1)
-                xs.append(self.fuse_img_feat(x, idx, img, img_mask, text_mask=src_tokens.ne(self.padding_idx)))
+                xs.append(self.fuse_img_feat(x_vision, idx, img, img_mask, text_mask=src_tokens.ne(self.padding_idx))) # x_vision is equal to x_text
                 idx += 1
 
-        x = self.f(xs, fun='sum')
+        # Existing selective visual memory: one visual summary per source token.
+        x_vision_selected = self.f(xs, fun='sum')
+
+        # Proposed minimal extension:
+        #   decoder vision memory = [selective visual summaries ; full image features]
+        # The decoder layer itself is unchanged and still uses its existing vision
+        # cross-attention, but it can now recover information discarded by selection.
+        if self.decoder_full_image:
+            if len(raw_vision_xs) == 0:
+                raise ValueError("--decoder-full-image requires at least one image feature tensor")
+
+            x_vision_full = torch.cat(raw_vision_xs, dim=0)
+            full_vision_padding_mask = torch.cat(raw_vision_masks, dim=1)
+
+            x_vision = torch.cat(
+                [x_vision_selected, x_vision_full],
+                dim=0,
+            )
+            vision_padding_mask = torch.cat(
+                [encoder_padding_mask, full_vision_padding_mask],
+                dim=1,
+            )
+        else:
+            x_vision = x_vision_selected
+            vision_padding_mask = encoder_padding_mask
 
         return EncoderOut(
-            encoder_out=x,  # T x B x C
+            encoder_out=x_text,  # T x B x C
             encoder_padding_mask=encoder_padding_mask,  # B x T
             encoder_embedding=encoder_embedding,  # B x T x C
             encoder_states=encoder_states,  # List[T x B x C]
             src_tokens=None,
             src_lengths=None,
+            vision_out=x_vision,                      # (T_selected + V_full, B, C) when enabled
+            vision_padding_mask=vision_padding_mask,  # (B, T_selected + V_full) when enabled
+            vision_embedding=None,                    # 안 쓰면 None
+            vision_states=None,                       # 안 쓰면 None
         )
 
     @torch.jit.export
@@ -550,6 +602,9 @@ class TransformerEncoder(FairseqEncoder):
         """
         encoder_padding_mask: Optional[Tensor] = encoder_out.encoder_padding_mask
         encoder_embedding: Optional[Tensor] = encoder_out.encoder_embedding
+        # Important: vision memory can now be longer than the source sequence,
+        # so reorder the actual vision mask rather than reusing encoder_padding_mask.
+        vision_padding_mask: Optional[Tensor] = encoder_out.vision_padding_mask
 
         new_encoder_out = (
             encoder_out.encoder_out
@@ -579,6 +634,21 @@ class TransformerEncoder(FairseqEncoder):
             for idx, state in enumerate(encoder_states):
                 encoder_states[idx] = state.index_select(1, new_order)
 
+        # --- 멀티모달(vision_out) 쪽 재정렬 ---
+        new_vision_out = (
+            encoder_out.vision_out
+            if encoder_out.vision_out is None
+            else encoder_out.vision_out.index_select(1, new_order)    # (T,B,C)에서 B축 재정렬
+        )
+        new_vision_padding_mask = (
+            vision_padding_mask
+            if vision_padding_mask is None
+            else vision_padding_mask.index_select(0, new_order)       # (B,T)에서 B축 재정렬
+        )
+        # vision_embedding / vision_states를 쓰지 않는다면 None 유지
+        new_vision_embedding = None
+        new_vision_states = None
+
         return EncoderOut(
             encoder_out=new_encoder_out,  # T x B x C
             encoder_padding_mask=new_encoder_padding_mask,  # B x T
@@ -586,6 +656,10 @@ class TransformerEncoder(FairseqEncoder):
             encoder_states=encoder_states,  # List[T x B x C]
             src_tokens=src_tokens,  # B x T
             src_lengths=src_lengths,  # B x 1
+            vision_out=new_vision_out,                   # (T,B,C) or None
+            vision_padding_mask=new_vision_padding_mask, # (B,T) or None
+            vision_embedding=new_vision_embedding,       # None
+            vision_states=new_vision_states,             # None
         )
 
     def max_positions(self):
@@ -783,8 +857,10 @@ class TransformerDecoder(FairseqIncrementalDecoder):
             alignment_heads=alignment_heads,
         )
         if not features_only:
-            x = self.output_layer(x)
-        return x, extra
+            x = self.output_layer(x) # B, T, V
+        return x, extra #정확히는 모르겠으나 tgt.txt self 이후로 추정됨
+
+    #추가지점_attention
 
     def extract_features(
         self,
@@ -897,7 +973,18 @@ class TransformerDecoder(FairseqIncrementalDecoder):
                 self_attn_padding_mask=self_attn_padding_mask,
                 need_attn=bool((idx == alignment_layer)),
                 need_head_weights=bool((idx == alignment_layer)),
+                vision_out = (
+                    encoder_out.vision_out
+                    if (encoder_out is not None and encoder_out.vision_out is not None)
+                    else None
+                ),
+                vision_padding_mask = (
+                    encoder_out.vision_padding_mask
+                    if (encoder_out is not None and encoder_out.vision_out is not None)
+                    else None
+                ),
             )
+
             inner_states.append(x)
             if layer_attn is not None and idx == alignment_layer:
                 attn = layer_attn.float().to(x)
@@ -918,7 +1005,12 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         if self.project_out_dim is not None:
             x = self.project_out_dim(x)
 
+        # image_multimodal_transformer_SA.py (디코더 쪽)
+        saved_text_attn = None
+        saved_vision_attn = None
+
         return x, {"attn": [attn], "inner_states": inner_states}
+
 
     def output_layer(self, features):
         """Project features to the vocabulary size."""
@@ -1054,6 +1146,9 @@ def base_architecture(args):
     args.no_scale_embedding = getattr(args, "no_scale_embedding", False)
     args.layernorm_embedding = getattr(args, "layernorm_embedding", False)
     args.tie_adaptive_weights = getattr(args, "tie_adaptive_weights", False)
+    args.decoder_full_image = getattr(args, "decoder_full_image", False)
+
+
 
 
 @register_model_architecture("image_multimodal_transformer_SA", "image_multimodal_transformer_SA_top")
@@ -1071,7 +1166,6 @@ def image_multimodal_transformer_SA_top(args):
     args.is_fusion_top = getattr(args, 'is_fusion_top', True)
 
     base_architecture(args)
-
 
 
 

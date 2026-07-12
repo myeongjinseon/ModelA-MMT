@@ -1,7 +1,7 @@
 #! /usr/bin/bash
 set -e
 
-device=0,1
+device=0
 task=multi30k-en2de
 image_feat=vit_tiny_patch16_384
 mask_data=mask0
@@ -51,11 +51,11 @@ elif [ $task == 'multi30k-en2fr' ]; then
 fi
 
 criterion=label_smoothed_cross_entropy
-fp16=1 #0
+fp16=0 #0
 lr=0.005
 warmup=2000
 max_tokens=4096
-update_freq=1
+update_freq=2
 keep_last_epochs=10
 patience=10
 max_update=8000
@@ -80,8 +80,8 @@ elif [ $image_feat == "vit_large_patch16_384" ]; then
 fi
 
 # multi-feature
-#image_feat_path=data/vit_large_patch16_384 data/vit_tiny_patch16_384
-#image_feat_dim=1024 192
+image_feat_path=data/vit_large_patch16_384 data/vit_tiny_patch16_384
+image_feat_dim=1024 192
 
 cp ${BASH_SOURCE[0]} $save_dir/train.sh
 
@@ -100,7 +100,8 @@ cmd="fairseq-train data-bin/$data_dir
   --find-unused-parameters
   --share-all-embeddings
   --patience $patience
-  --keep-last-epochs $keep_last_epochs"
+  --keep-last-epochs $keep_last_epochs
+  --eval-bleu --eval-tokenized-bleu"
 
 if [ $fp16 -eq 1 ]; then
 cmd=${cmd}" --fp16 "
@@ -117,3 +118,5 @@ export CUDA_VISIBLE_DEVICES=$device
 cmd="nohup "${cmd}" > $save_dir/train.log 2>&1 &"
 eval $cmd
 tail -f $save_dir/train.log
+
+#   --image-pre-norm

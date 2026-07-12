@@ -146,8 +146,12 @@ def load_langpair_dataset(
         feat_pth_path = os.path.join(image_feat_path, split+'.pth')
         mask_pth_path = os.path.join(image_feat_path, split+'_mask.pth')
         assert os.path.exists(feat_pth_path) == True, 'not found image feature'
-
         img_dataset = ImageDataset(feat_pth_path, mask_pth_path)
+        
+        # feat_pth_path = os.path.join(image_feat_path, split+'.npy')
+        # assert os.path.exists(feat_pth_path) == True, 'not found image feature'
+        # img_dataset = ImageDataset(feat_pth_path)
+
         assert len(img_dataset) == len(src_dataset)
         img_dataset_list.append(img_dataset)
     
@@ -388,8 +392,15 @@ class ImageMMTTask(LegacyFairseqTask):
 
             if max(totals) > 0:
                 # log counts as numpy arrays -- log_scalar will sum them correctly
+                
+                #for multi-gpu
+                # metrics.log_scalar("_bleu_counts", np.array([c.detach().cpu().item() for c in counts]))
+                # metrics.log_scalar("_bleu_totals", np.array([c.detach().cpu().item() for c in totals]))
+                
+                #for single-gpu
                 metrics.log_scalar("_bleu_counts", np.array(counts))
                 metrics.log_scalar("_bleu_totals", np.array(totals))
+                
                 metrics.log_scalar("_bleu_sys_len", sum_logs("_bleu_sys_len"))
                 metrics.log_scalar("_bleu_ref_len", sum_logs("_bleu_ref_len"))
 

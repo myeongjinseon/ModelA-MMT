@@ -13,6 +13,7 @@ import math
 import os
 import random
 import sys
+import wandb
 
 import numpy as np
 import torch
@@ -120,6 +121,11 @@ def main(args):
     train_meter = meters.StopwatchMeter()
     train_meter.start()
 
+    # wandb.init(
+    #     entity="22100356-handong-global-university",
+    #     project="fairseq_modelA_(1-lambda)*text + lambda*img",
+    #     name=args.wandb_run_name + "_lambda"
+    # )
     while lr > args.min_lr and epoch_itr.next_epoch_idx <= max_epoch:
         # train for one epoch
         valid_losses, should_stop = train(args, trainer, task, epoch_itr)
@@ -139,6 +145,7 @@ def main(args):
         
     train_meter.stop()
     logger.info("done training in {:.1f} seconds".format(train_meter.sum))
+    # wandb.finish()
 
 
 def should_stop_early(args, valid_loss):
@@ -344,6 +351,8 @@ def get_valid_stats(args, trainer, stats):
 
 def cli_main(modify_parser=None):
     parser = options.get_training_parser()
+    parser.add_argument('--wandb-run-name', type=str, default=None,
+                        help='Weights & Biases run name')
     args = options.parse_args_and_arch(parser, modify_parser=modify_parser)
     
     if args.profile:

@@ -63,7 +63,7 @@ if __name__ == "__main__":
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
     print('extracting ' + dataset + '\'s image feature from '+model_name) 
-    model = timm.create_model(model_name, pretrained=True, num_classes=0).to('cuda:0') # if use cpu, uncomment '.to('cuda:0')'
+    model = timm.create_model(model_name, pretrained=True, num_classes=0).to('cuda:3') # if use cpu, uncomment '.to('cuda:0')'
     model.eval()
     config = resolve_data_config({}, model=model)
     transform = create_transform(**config)
@@ -77,11 +77,11 @@ if __name__ == "__main__":
         for i in tqdm(filenames):
             i = os.path.join(flickr30k_path, dic[dataset]+'-images', i)
             img = Image.open(i).convert("RGB")
-            input = transform(img).unsqueeze(0).to('cuda:0') # transform and add batch dimension
+            input = transform(img).unsqueeze(0).to('cuda:3') # transform and add batch dimension
             
             out = model.forward_features(input)
             
-            tmp.append(out.detach().to('cuda:1'))
+            tmp.append(out.detach().to('cuda:4'))
             if len(tmp) == 2000:
                 res = torch.cat(tmp).cpu()
                 print(res.shape)
